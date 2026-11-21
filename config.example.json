@@ -1,0 +1,43 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 7860,
+    "open_browser": true
+  },
+  "skill": {
+    "last_path": "",
+    "exclude_meta_docs": false,
+    "max_prompt_chars": 0,
+    "library_dirs": [
+      "skills",
+      "C:\\Users\\nzp18\\Desktop\\角色skill"
+    ]
+  },
+  "llama": {
+    "engine_mode": "managed_server",
+    "engine_dir": "engines",
+    "models_dir": "models",
+    "llama_cpp_path": "",
+    "model_path": "",
+    "mmproj_path": "",
+    "multimodal_enabled": true,
+    "server_url": "http://127.0.0.1:8080",
+    "host": "127.0.0.1",
+    "port": 8080,
+    "ctx_size": 16384,
+    "n_gpu_layers": -1,
+    "startup_timeout_sec": 60,
+    "request_timeout_sec": 120,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "max_tokens": 512,
+    "max_history_turns": 20
+  },
+  "t2i": {
+    "enabled": false,
+    "active_plugin": "noop",
+    "context_window_turns": 4,
+    "plugins_dir": "plugins/t2i",
+    "plugin_settings": {}
+  }
+}

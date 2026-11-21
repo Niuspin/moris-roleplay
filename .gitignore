@@ -1,0 +1,20 @@
+# Python cache & runtime files
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+config.json
+
+# Large local model weights (.gguf) - keep directory structure & READMEs
+models/**/*.gguf
+models/**/*.bin
+!models/**/README.md
+
+# Local compiled llama.cpp binaries & CUDA DLLs (>100MB GitHub limit) - keep directory structure & READMEs
+engines/**/*.exe
+engines/**/*.dll
+engines/**/*.lib
+engines/**/*.exp
+engines/**/*.pdb
+engines/**/*.zip
+!engines/**/README.md
