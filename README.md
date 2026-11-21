@@ -2,8 +2,8 @@
 
 **Moris Roleplay** 是一个绝对轻量化（零第三方 Python 依赖、零前端构建工具、零外部 CDN）、便于后续扩展更新的本地 AI 角色扮演聊天 Web 应用。
 
-- **一键 `.bat` 启动**：双击或命令行运行 `start.bat` 即可启动本地服务并打开浏览器访问。
-- **专属角色 Skill 库 (`skills/` + 外部库关联)**：自动扫描项目 `skills/` 目录及关联的外部角色库（默认已关联 `C:\Users\nzp18\Desktop\角色skill`），支持下拉一键切换角色；加载文件夹时**严格只读取 `.md` 文件**并自动忽略非 `.md` 文件（如 `LICENSE`、`manifest.json`、图片、`.git/` 等）。
+- **独立桌面窗口 & 无黑框启动**：双击 `MorisRoleplay.vbs` 或 `start.bat` 即可无 CMD 黑框启动独立桌面应用窗口（基于 `PySide6` / `pywebview`，不依赖本地浏览器）；关闭窗口自动清理本地模型引擎进程。
+- **专属角色 Skill 库 (`skills/` + 可配置外部库)**：自动扫描项目 `skills/` 目录（及桌面可选的 `角色skill` 目录与自定义外部库），支持卡片一键切换角色；加载文件夹时**严格只读取 `.md` 文件**并自动忽略非 `.md` 文件（如 `LICENSE`、`manifest.json`、图片、`.git/` 等）。
 - **专属本地 `llama.cpp` 引擎库 (`engines/`) 与多模态 GGUF 模型库 (`models/`)**：
   - 自动扫描 `engines/` 下的 `llama-server.exe` / `llama-cli.exe` / `llama-mtmd-cli.exe`；
   - 自动扫描 `models/` 下的 `.gguf` 主模型与 `*mmproj*.gguf` 视觉投影器权重，并在选择多模态模型时**自动配对绑定 `mmproj`**，启动时自动附加 `--mmproj` 参数；
@@ -60,10 +60,10 @@ moris roleplay/
    - 纯文本模型放入 `models/llm/`（如 `Qwen2.5-7B-Instruct-Q4_K_M.gguf`）；
    - 多模态视觉模型将主模型 `.gguf` 与视觉投影器 `*mmproj*.gguf` 一并放入 `models/multimodal/`。
 3. **角色 Skill 库 (`skills/`)**：
-   - 可将角色 `.md` 文件或文件夹放入 `skills/` 目录；同时系统默认已关联桌面 `C:\Users\nzp18\Desktop\角色skill` 目录。
+   - 将角色 `.md` 文件或文件夹放入 `skills/` 目录即可自动发现（也可在设置中心自定义任意外部目录，或使用桌面 `角色skill` 目录）。
 
 ### 2. 启动应用
-双击运行 **`start.bat`**，或在终端中执行：
+双击运行 **`MorisRoleplay.vbs`**（完全无黑框）或 **`start.bat`**，或在终端中执行：
 
 ```bat
 start.bat

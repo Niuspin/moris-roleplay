@@ -1,300 +1,583 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="cafe" data-layout="bubble" data-font="sans">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Moris Roleplay — 本地轻量化 AI 角色扮演工作台</title>
+  <title>Moris Roleplay — 本地沉浸式 AI 角色扮演剧场</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="app-layout">
-    <!-- Left Sidebar: Skill Library, Engine & Multimodal Model Library, T2I Extension -->
-    <aside class="sidebar">
-      <header class="brand-header">
-        <div class="brand-title-row">
-          <h1>Moris Roleplay</h1>
-          <div class="header-badges">
-            <button type="button" id="btn-rescan-library" class="btn btn-xs btn-secondary" title="重新扫描 engines/、models/ 与 skills/ 库">刷新本地库</button>
-            <span id="health-badge" class="badge badge-neutral">连接中</span>
-          </div>
-        </div>
-        <p class="brand-subtitle">角色 Skill 库 (.md) · llama.cpp 引擎与多模态模型库 (GGUF/mmproj) · 场景文生图扩展</p>
-      </header>
-
-      <!-- Section 1: Character Skill Library & Loader -->
-      <section class="panel" id="skill-panel">
-        <div class="panel-header">
-          <h2>1. 角色 Skill 库 (.md)</h2>
-          <span id="skill-status-badge" class="badge badge-neutral">未加载</span>
-        </div>
-
-        <div class="form-group">
-          <label for="skill-library-select">从本地 Skill 库快速选择 (<span id="skill-lib-count">0</span> 个角色)</label>
-          <select id="skill-library-select">
-            <option value="">-- 请从 Skill 库选择角色，或在下方输入自定义路径 --</option>
-          </select>
-          <small class="field-hint">自动扫描项目 <code>skills/</code> 目录及关联的外部角色库（如桌面 <code>角色skill</code>）</small>
-        </div>
-
-        <div class="form-group">
-          <label for="skill-path-input">角色 Skill 文件或文件夹路径</label>
-          <input
-            type="text"
-            id="skill-path-input"
-            placeholder="例如: C:\Users\nzp18\Desktop\角色skill\流萤\firefly-skill"
-            autocomplete="off"
-          />
-          <small class="field-hint">支持单个 <code>.md</code> 文件或包含多个 <code>.md</code> 的文件夹（严格只读 <code>.md</code> 文件）</small>
-        </div>
-
-        <div class="form-row checkbox-row">
-          <label class="checkbox-label">
-            <input type="checkbox" id="skill-exclude-meta" />
-            <span>排除说明与评测文档 (README / report)</span>
-          </label>
-        </div>
-        <div class="form-group">
-          <label for="skill-max-chars">最大提示词字符预算 (0 = 不限制)</label>
-          <input type="number" id="skill-max-chars" min="0" step="500" value="0" />
-        </div>
-        <div class="button-row">
-          <button type="button" id="btn-load-skill" class="btn btn-primary">加载角色 Skill</button>
-        </div>
-
-        <div id="skill-summary-box" class="summary-box hidden">
-          <div class="summary-line">
-            <strong>当前角色：</strong>
-            <span id="skill-char-name">-</span>
-            <span id="skill-source-type" class="tag">-</span>
-          </div>
-          <div class="summary-line">
-            <strong>字符 / 估算 Token：</strong>
-            <span id="skill-stats">0 chars / ~0 tokens</span>
-          </div>
-          <div class="summary-line">
-            <strong>已读取 .md 文件 (<span id="skill-loaded-count">0</span>)：</strong>
-            <div id="skill-loaded-files" class="file-pills"></div>
-          </div>
-          <div class="summary-line">
-            <strong>已忽略非 .md 文件 (<span id="skill-ignored-count">0</span>)：</strong>
-            <div id="skill-ignored-files" class="file-pills muted"></div>
-          </div>
-          <div id="skill-warnings" class="warning-box hidden"></div>
-          <details class="prompt-preview-details">
-            <summary>查看合成角色设定提示词 (System Prompt)</summary>
-            <pre id="skill-prompt-preview" class="prompt-preview"></pre>
-          </details>
-        </div>
-      </section>
-
-      <!-- Section 2: llama.cpp Engine Library & Multimodal GGUF Model Library -->
-      <section class="panel" id="engine-panel">
-        <div class="panel-header">
-          <h2>2. llama.cpp 引擎库与多模态模型库</h2>
-          <span id="engine-status-badge" class="badge badge-neutral">stopped</span>
-        </div>
-
-        <div class="form-group">
-          <label for="llama-engine-mode">驱动模式 (Engine Mode)</label>
-          <select id="llama-engine-mode">
-            <option value="managed_server">managed_server (自动拉起本地 llama-server)</option>
-            <option value="external_server">external_server (连接已运行的 llama-server)</option>
-            <option value="cli">cli (单轮调用 llama-cli 可执行文件)</option>
-          </select>
-        </div>
-
-        <div id="managed-fields">
-          <!-- Dedicated Engine Library Selector -->
-          <div class="form-group">
-            <label for="engine-library-select">本地引擎库 (<code>engines/</code> · 已发现 <span id="engine-lib-count">0</span> 个)</label>
-            <select id="engine-library-select">
-              <option value="">-- 从 engines/ 库选择或手动填写下方路径 --</option>
-            </select>
-            <input
-              type="text"
-              id="llama-cpp-path"
-              placeholder="例如: engines\llama.cpp\llama-server.exe"
-              autocomplete="off"
-            />
-          </div>
-
-          <!-- Dedicated Model Library Selector -->
-          <div class="form-group">
-            <label for="model-library-select">本地 GGUF 模型库 (<code>models/</code> · 已发现 <span id="model-lib-count">0</span> 个主模型)</label>
-            <select id="model-library-select">
-              <option value="">-- 从 models/ 库选择 .gguf 主模型或手动填写 --</option>
-            </select>
-            <input
-              type="text"
-              id="llama-model-path"
-              placeholder="例如: models\multimodal\Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
-              autocomplete="off"
-            />
-          </div>
-
-          <!-- Multimodal Vision Projector (mmproj) Selector -->
-          <div class="form-group">
-            <label for="mmproj-library-select">多模态视觉投影器 (<code>--mmproj</code> · 已发现 <span id="mmproj-lib-count">0</span> 个)</label>
-            <select id="mmproj-library-select">
-              <option value="">-- 纯文本模式 (不使用 mmproj 视觉投影器) --</option>
-            </select>
-            <input
-              type="text"
-              id="llama-mmproj-path"
-              placeholder="可选: models\multimodal\mmproj-model-f16.gguf (多模态视觉权重)"
-              autocomplete="off"
-            />
-            <small class="field-hint">选择多模态主模型时将自动匹配同目录下的 <code>*mmproj*.gguf</code> 权重</small>
-          </div>
-
-          <div class="form-row checkbox-row">
-            <label class="checkbox-label">
-              <input type="checkbox" id="llama-multimodal-enabled" checked />
-              <span>启用视觉多模态图片输入（允许在聊天框上传/粘贴图片）</span>
-            </label>
-          </div>
-
-          <div class="grid-2col">
-            <div class="form-group">
-              <label for="llama-port">本地服务端口</label>
-              <input type="number" id="llama-port" min="1" max="65535" value="8080" />
-            </div>
-            <div class="form-group">
-              <label for="llama-ctx-size">上下文长度 (-c)</label>
-              <input type="number" id="llama-ctx-size" min="256" step="512" value="16384" />
+  <div class="app-shell" id="app-shell">
+    <!-- Left Navigation Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand-row">
+          <div class="brand-mark">
+            <span class="brand-orb"></span>
+            <div class="brand-text">
+              <h1>Moris</h1>
+              <span class="brand-tag">Roleplay</span>
             </div>
           </div>
-          <div class="form-group">
-            <label for="llama-ngl">GPU 卸载层数 (-ngl, -1=全部)</label>
-            <input type="number" id="llama-ngl" min="-1" value="-1" />
+          <button type="button" id="btn-new-session" class="btn btn-primary btn-sm" title="新建对话">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>
+            <span>新对话</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Character Library Quick Switcher -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <span>角色 Skill 库 (<strong id="skill-lib-count">0</strong>)</span>
+          <button type="button" id="btn-rescan-library" class="icon-btn-sm" title="刷新本地引擎、模型与角色库">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+        </div>
+        <div id="character-card-list" class="character-list">
+          <div class="sidebar-empty">正在扫描本地角色库...</div>
+        </div>
+      </div>
+
+      <!-- Persistent Session History -->
+      <div class="sidebar-section sidebar-sessions-wrap">
+        <div class="sidebar-section-header">
+          <span>历史会话 (<strong id="session-list-count">0</strong>)</span>
+        </div>
+        <div id="session-history-list" class="session-list">
+          <div class="sidebar-empty">暂无历史对话</div>
+        </div>
+      </div>
+
+      <!-- Sidebar Footer: Engine Quick Control + Settings + Theme -->
+      <div class="sidebar-footer">
+        <div class="engine-mini-card">
+          <div class="engine-mini-top">
+            <div class="engine-dot-wrap">
+              <span id="engine-status-dot" class="status-dot dot-stopped"></span>
+              <span id="engine-status-badge" class="engine-mini-label">未启动</span>
+            </div>
+            <button type="button" id="btn-quick-toggle-engine" class="btn btn-xs btn-primary">一键就绪</button>
           </div>
+          <div id="engine-mini-model" class="engine-mini-sub">点击一键就绪自动启动引擎</div>
         </div>
 
-        <div id="external-fields" class="hidden">
-          <div class="form-group">
-            <label for="llama-server-url">外部 llama-server 地址</label>
-            <input
-              type="text"
-              id="llama-server-url"
-              placeholder="http://127.0.0.1:8080"
-              autocomplete="off"
-            />
-          </div>
+        <div class="sidebar-footer-actions">
+          <button type="button" id="btn-open-settings" class="btn btn-ghost btn-sm flex-1">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span>设置中心</span>
+          </button>
+          <button type="button" id="btn-open-theme" class="btn btn-ghost btn-sm flex-1">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.68 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9z"/></svg>
+            <span>外观主题</span>
+          </button>
         </div>
-
-        <div class="grid-2col">
-          <div class="form-group">
-            <label for="llama-temperature">Temperature</label>
-            <input type="number" id="llama-temperature" min="0" max="2" step="0.05" value="0.8" />
-          </div>
-          <div class="form-group">
-            <label for="llama-top-p">Top-P</label>
-            <input type="number" id="llama-top-p" min="0.05" max="1" step="0.05" value="0.9" />
-          </div>
-        </div>
-        <div class="grid-2col">
-          <div class="form-group">
-            <label for="llama-max-tokens">单轮最大生成 Tokens</label>
-            <input type="number" id="llama-max-tokens" min="1" max="8192" value="512" />
-          </div>
-          <div class="form-group">
-            <label for="llama-max-history">保留历史轮数</label>
-            <input type="number" id="llama-max-history" min="0" max="100" value="20" />
-          </div>
-        </div>
-
-        <div class="button-row">
-          <button type="button" id="btn-save-config" class="btn btn-secondary">保存配置</button>
-          <button type="button" id="btn-start-engine" class="btn btn-primary">启动 / 连接引擎</button>
-          <button type="button" id="btn-stop-engine" class="btn btn-danger">停止</button>
-        </div>
-        <div id="engine-detail-line" class="status-detail"></div>
-      </section>
-
-      <!-- Section 3: Post-Turn Scene T2I Extension Interface -->
-      <section class="panel" id="t2i-panel">
-        <div class="panel-header">
-          <h2>3. 场景文生图扩展接口 (T2I Hook)</h2>
-          <span id="t2i-status-badge" class="badge badge-neutral">未启用</span>
-        </div>
-        <div class="form-row checkbox-row">
-          <label class="checkbox-label">
-            <input type="checkbox" id="t2i-enabled" />
-            <span>单轮对话完成后触发场景文生图扩展接口</span>
-          </label>
-        </div>
-        <div class="grid-2col">
-          <div class="form-group">
-            <label for="t2i-active-plugin">启用插件 (Active Plugin)</label>
-            <select id="t2i-active-plugin">
-              <option value="noop">noop (默认不调用模型)</option>
-              <option value="example_stub">example_stub (演练提示词合成桩)</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label for="t2i-context-turns">场景上下文轮数</label>
-            <input type="number" id="t2i-context-turns" min="1" max="20" value="4" />
-          </div>
-        </div>
-        <div class="form-group">
-          <label for="t2i-plugin-settings">插件自定义参数 (JSON)</label>
-          <textarea id="t2i-plugin-settings" rows="2" placeholder='{"style": "anime"}'>{}</textarea>
-        </div>
-        <div class="button-row">
-          <button type="button" id="btn-save-t2i" class="btn btn-secondary">保存文生图扩展设置</button>
-        </div>
-        <div id="t2i-last-hook-box" class="summary-box">
-          <div class="summary-line">
-            <strong>最近一次 Hook 状态：</strong>
-            <span id="t2i-last-status">尚未触发</span>
-          </div>
-          <div id="t2i-last-prompt" class="status-detail"></div>
-        </div>
-      </section>
+      </div>
     </aside>
 
-    <!-- Main Chat Stage -->
-    <main class="chat-main">
-      <header class="chat-header">
-        <div class="chat-header-info">
-          <h2 id="active-character-title">未加载角色 Skill（通用对话模式）</h2>
-          <p id="active-character-desc">请先在左侧从 Skill 库选择或输入角色 Skill (.md) 路径并点击“加载角色 Skill”</p>
+    <!-- Main Chat Theater -->
+    <main class="chat-stage">
+      <!-- Clean Top Header -->
+      <header class="stage-header">
+        <div class="stage-header-left">
+          <button type="button" id="btn-toggle-sidebar" class="icon-btn" title="折叠 / 展开侧边栏">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+          </button>
+          <div class="active-char-avatar" id="active-char-avatar">M</div>
+          <div class="active-char-meta">
+            <div class="active-char-title-row">
+              <h2 id="active-character-title">未加载角色 Skill</h2>
+              <span id="skill-status-badge" class="pill pill-muted">未加载</span>
+              <span id="multimodal-mode-pill" class="pill pill-info">纯文本</span>
+            </div>
+            <p id="active-character-desc">在左侧点击角色卡片即可一键进入角色扮演</p>
+          </div>
         </div>
-        <div class="chat-header-actions">
-          <span id="multimodal-mode-pill" class="session-pill">多模态: 纯文本</span>
-          <span class="session-pill">会话: <code id="session-id-label">default</code></span>
-          <button type="button" id="btn-reset-session" class="btn btn-secondary">清空当前对话记录</button>
+
+        <div class="stage-header-actions">
+          <button type="button" id="btn-toggle-immersion" class="pill-btn" title="开启深度角色扮演沉浸强化指令（防跳戏、丰富动作与情绪描写）">
+            <span class="pill-dot"></span>
+            <span>沉浸扮演</span>
+          </button>
+          <button type="button" id="btn-open-director" class="btn btn-ghost btn-sm" title="随时调整当前场景、用户人设与导演提示 (Author's Note)">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+            <span>导演提示</span>
+          </button>
+          <button type="button" id="btn-export-chat" class="icon-btn" title="导出当前对话为 Markdown">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
+          <button type="button" id="btn-reset-session" class="icon-btn" title="清空当前对话记录">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </button>
+          <span id="health-badge" class="pill pill-muted">连接中</span>
         </div>
       </header>
 
-      <div id="notification-banner" class="notification-banner hidden"></div>
+      <!-- Floating Toast Notification -->
+      <div id="notification-banner" class="toast hidden" role="status"></div>
 
+      <!-- Quick Director Note Popover Bar (Collapsible) -->
+      <div id="director-drawer" class="director-drawer hidden">
+        <div class="director-drawer-inner">
+          <div class="director-field">
+            <label for="quick-scenario">当前场景设定 (Scenario)</label>
+            <input type="text" id="quick-scenario" placeholder="例如：黄昏时分的稻妻鸣神大社，微风拂过樱花树..." />
+          </div>
+          <div class="director-field">
+            <label for="quick-authors-note">导演提示 (Author's Note · 动态防 OOC)</label>
+            <input type="text" id="quick-authors-note" placeholder="例如：保持细腻的眼神与动作描写，语气温柔而克制..." />
+          </div>
+          <div class="director-actions">
+            <button type="button" id="btn-save-director" class="btn btn-primary btn-sm">应用</button>
+            <button type="button" id="btn-close-director" class="btn btn-ghost btn-sm">收起</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Conversation Stream -->
       <section id="chat-messages" class="chat-messages" aria-live="polite">
-        <div class="empty-chat-placeholder" id="empty-chat-placeholder">
-          <h3>准备开始角色扮演对话</h3>
-          <p>1. 在左侧 <strong>角色 Skill 库</strong> 一键选择角色（或输入自定义 <code>.md</code> 路径），自动加载设定提示词。</p>
-          <p>2. 在左侧 <strong>llama.cpp 引擎库与多模态模型库</strong> 选择本地引擎、<code>.gguf</code> 主模型及可选的 <code>mmproj</code> 视觉投影器。</p>
-          <p>3. 在下方输入框发送台词，支持点击 <strong>“添加图片 (多模态)”</strong> 或直接粘贴图片发给多模态模型识别。</p>
+        <div class="welcome-stage" id="empty-chat-placeholder">
+          <div class="welcome-avatar" id="welcome-avatar">M</div>
+          <h3 id="welcome-title">欢迎来到 Moris Roleplay</h3>
+          <p id="welcome-subtitle">本地零依赖 · 角色 Skill 驱动 · 流式响应 · 多模态视觉互动</p>
+          <div class="welcome-quick-actions">
+            <button type="button" id="btn-welcome-quick-ready" class="btn btn-primary">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <span>一键就绪（自动加载角色并启动引擎）</span>
+            </button>
+            <button type="button" id="btn-welcome-settings" class="btn btn-secondary">配置引擎与模型</button>
+          </div>
+          <div class="starter-prompts" id="starter-prompts">
+            <button type="button" class="starter-chip" data-prompt="*推开微掩的木门，迎着室内的暖光向你走来* 好久不见，今天过得怎么样？">推门问候 · 日常开场</button>
+            <button type="button" class="starter-chip" data-prompt="*抬头望向渐暗的天色，轻声说道* 雨好像快要落下来了，我们找个地方避避雨吧。">雨幕偶遇 · 氛围开场</button>
+            <button type="button" class="starter-chip" data-prompt="*将一杯温热的茶推到你面前，微微一笑* 忙了这么久，先歇一会儿，跟我聊聊你最近的心事吧。">茶叙深谈 · 情感互动</button>
+          </div>
         </div>
       </section>
 
-      <footer class="chat-composer">
-        <div id="chat-image-previews" class="image-preview-strip hidden"></div>
-        <textarea
-          id="chat-input"
-          rows="3"
-          placeholder="输入你想对角色说的话或动作描写... (支持 Ctrl+V 粘贴图片；Enter 发送，Shift + Enter 换行)"
-        ></textarea>
-        <div class="composer-actions">
-          <div class="composer-left-tools">
-            <input type="file" id="chat-image-input" accept="image/*" multiple class="hidden" />
-            <button type="button" id="btn-add-image" class="btn btn-secondary btn-sm">添加图片 (多模态)</button>
-            <span id="turn-counter-label" class="turn-counter">当前轮次: 0</span>
+      <!-- Floating Composer -->
+      <footer class="composer-wrap">
+        <div class="composer-card" id="composer-card">
+          <div id="chat-image-previews" class="image-preview-strip hidden"></div>
+          <textarea
+            id="chat-input"
+            rows="2"
+            placeholder="输入对话或 *动作描写* ... (Enter 发送 · Shift+Enter 换行 · 支持 Ctrl+V 粘贴图片)"
+          ></textarea>
+          <div class="composer-toolbar">
+            <div class="composer-left-tools">
+              <input type="file" id="chat-image-input" accept="image/*" multiple class="hidden" />
+              <button type="button" id="btn-add-image" class="tool-btn" title="添加多模态图片（支持 Ctrl+V 粘贴）">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                <span>图片</span>
+              </button>
+              <button type="button" id="btn-regenerate-last" class="tool-btn" title="重新生成上一条角色回复">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+                <span>重试</span>
+              </button>
+              <span id="turn-counter-label" class="meta-hint">轮次 0</span>
+              <span id="speed-metric-label" class="meta-hint"></span>
+            </div>
+            <div class="composer-right-tools">
+              <button type="button" id="btn-stop-stream" class="btn btn-danger btn-sm hidden">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                <span>停止生成</span>
+              </button>
+              <button type="button" id="btn-send-chat" class="btn btn-primary btn-send">
+                <span>发送</span>
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
           </div>
-          <button type="button" id="btn-send-chat" class="btn btn-primary btn-send">发送消息</button>
         </div>
       </footer>
     </main>
+  </div>
+
+  <!-- Settings Modal (Tabbed: Roleplay & Skill / Engine & Models / T2I Extension) -->
+  <div id="settings-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-header">
+        <h3 id="settings-modal-title">设置中心</h3>
+        <div class="modal-tabs" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="tab-roleplay">角色与扮演</button>
+          <button type="button" class="tab-btn" data-tab="tab-engine">引擎与模型库</button>
+          <button type="button" class="tab-btn" data-tab="tab-t2i">场景文生图 (T2I)</button>
+        </div>
+        <button type="button" class="icon-btn modal-close" data-close-modal="settings-modal" aria-label="关闭">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Tab 1: Roleplay Depth & Skill Loader -->
+        <div id="tab-roleplay" class="tab-pane active">
+          <div class="settings-card">
+            <h4>角色 Skill 加载 (.md)</h4>
+            <div class="form-group">
+              <label for="skill-library-select">从本地 Skill 库选择</label>
+              <select id="skill-library-select">
+                <option value="">-- 请选择角色或在下方输入路径 --</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="skill-path-input">自定义 Skill 文件或文件夹路径</label>
+              <div class="input-with-btn">
+                <input type="text" id="skill-path-input" placeholder="例如: skills\流萤\firefly-skill 或任意 .md 路径" autocomplete="off" />
+                <button type="button" id="btn-load-skill" class="btn btn-primary btn-sm">加载 Skill</button>
+              </div>
+            </div>
+            <div class="grid-2col">
+              <label class="checkbox-label">
+                <input type="checkbox" id="skill-exclude-meta" />
+                <span>排除说明/评测文档 (README / report)</span>
+              </label>
+              <div class="form-group compact">
+                <label for="skill-max-chars">最大提示词字符预算 (0 = 不限)</label>
+                <input type="number" id="skill-max-chars" min="0" step="500" value="0" />
+              </div>
+            </div>
+            <div id="skill-summary-box" class="summary-box hidden">
+              <div class="summary-line">
+                <strong>当前角色：</strong><span id="skill-char-name">-</span>
+                <span id="skill-source-type" class="pill pill-muted">-</span>
+                <span id="skill-stats" class="meta-hint">0 chars</span>
+              </div>
+              <div class="summary-line">
+                <strong>已读取 .md (<span id="skill-loaded-count">0</span>)：</strong>
+                <div id="skill-loaded-files" class="file-pills"></div>
+              </div>
+              <div class="summary-line">
+                <strong>已忽略非 .md (<span id="skill-ignored-count">0</span>)：</strong>
+                <div id="skill-ignored-files" class="file-pills muted"></div>
+              </div>
+              <div id="skill-warnings" class="warning-box hidden"></div>
+              <details class="prompt-preview-details">
+                <summary>查看合成角色设定提示词 (System Prompt)</summary>
+                <pre id="skill-prompt-preview" class="prompt-preview"></pre>
+              </details>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <h4>深度扮演增强（人设 / 场景 / 导演提示）</h4>
+            <div class="grid-2col">
+              <div class="form-group">
+                <label for="rp-user-name">你的称呼 (User Name)</label>
+                <input type="text" id="rp-user-name" placeholder="旅者" />
+              </div>
+              <div class="form-group">
+                <label for="rp-authors-note-depth">导演提示注入深度 (距最新消息条数)</label>
+                <input type="number" id="rp-authors-note-depth" min="0" max="20" value="2" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="rp-user-persona">你的人设设定 (User Persona · 可选)</label>
+              <textarea id="rp-user-persona" rows="2" placeholder="描述你的身份、外貌、性格或与角色的关系..."></textarea>
+            </div>
+            <div class="form-group">
+              <label for="rp-scenario">当前剧情场景 (Scenario · 可选)</label>
+              <textarea id="rp-scenario" rows="2" placeholder="描述故事发生的时间、地点与当前氛围..."></textarea>
+            </div>
+            <div class="form-group">
+              <label for="rp-authors-note">导演提示 (Author's Note · 强力防长对话 OOC)</label>
+              <textarea id="rp-authors-note" rows="2" placeholder="例如：注重心理描写与神态细节，每次回复包含动作与对话，保持角色原著口吻..."></textarea>
+            </div>
+            <label class="checkbox-label">
+              <input type="checkbox" id="rp-immersion-mode" />
+              <span>启用沉浸式扮演指令强化（禁止跳戏为 AI，鼓励动作/神态/环境描写）</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Tab 2: Engine & Multimodal Model Library -->
+        <div id="tab-engine" class="tab-pane">
+          <div class="settings-card">
+            <div class="card-title-row">
+              <h4>llama.cpp 引擎与多模态模型库</h4>
+              <div class="button-row-inline">
+                <button type="button" id="btn-start-engine" class="btn btn-primary btn-sm">启动 / 连接</button>
+                <button type="button" id="btn-stop-engine" class="btn btn-danger btn-sm">停止引擎</button>
+              </div>
+            </div>
+            <div id="engine-detail-line" class="status-detail">状态：stopped</div>
+
+            <div class="form-group">
+              <label for="llama-engine-mode">驱动模式 (Engine Mode)</label>
+              <select id="llama-engine-mode">
+                <option value="managed_server">managed_server (自动托管本地 llama-server)</option>
+                <option value="external_server">external_server (连接外部已运行 llama-server)</option>
+                <option value="cli">cli (单轮调用 llama-cli)</option>
+              </select>
+            </div>
+
+            <div id="managed-fields">
+              <div class="form-group">
+                <label for="engine-library-select">引擎库 (<code>engines/</code> · <span id="engine-lib-count">0</span> 个)</label>
+                <select id="engine-library-select">
+                  <option value="">-- 从 engines/ 库选择或手动填写 --</option>
+                </select>
+                <input type="text" id="llama-cpp-path" placeholder="engines\llama.cpp\llama-server.exe" autocomplete="off" />
+              </div>
+
+              <div class="form-group">
+                <label for="model-library-select">GGUF 主模型库 (<code>models/</code> · <span id="model-lib-count">0</span> 个)</label>
+                <select id="model-library-select">
+                  <option value="">-- 从 models/ 库选择主模型或手动填写 --</option>
+                </select>
+                <input type="text" id="llama-model-path" placeholder="models\multimodal\model.gguf" autocomplete="off" />
+              </div>
+
+              <div class="form-group">
+                <label for="mmproj-library-select">多模态视觉投影器 (<code>--mmproj</code> · <span id="mmproj-lib-count">0</span> 个)</label>
+                <select id="mmproj-library-select">
+                  <option value="">-- 纯文本模式 (不挂载 mmproj) --</option>
+                </select>
+                <input type="text" id="llama-mmproj-path" placeholder="可选: models\multimodal\mmproj-*.gguf" autocomplete="off" />
+              </div>
+
+              <div class="grid-3col">
+                <div class="form-group">
+                  <label for="llama-port">端口</label>
+                  <input type="number" id="llama-port" min="1" max="65535" value="8080" />
+                </div>
+                <div class="form-group">
+                  <label for="llama-ctx-size">上下文 (-c)</label>
+                  <input type="number" id="llama-ctx-size" min="256" step="512" value="16384" />
+                </div>
+                <div class="form-group">
+                  <label for="llama-ngl">GPU 层数 (-ngl)</label>
+                  <input type="number" id="llama-ngl" min="-1" value="-1" />
+                </div>
+              </div>
+            </div>
+
+            <div id="external-fields" class="hidden">
+              <div class="form-group">
+                <label for="llama-server-url">外部 llama-server 地址</label>
+                <input type="text" id="llama-server-url" placeholder="http://127.0.0.1:8080" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="grid-2col">
+              <label class="checkbox-label">
+                <input type="checkbox" id="llama-multimodal-enabled" checked />
+                <span>启用多模态视觉图片输入</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="llama-cache-prompt" checked />
+                <span>启用 Prompt KV-Cache 复用（大幅加速多轮首字响应）</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="card-title-row">
+              <h4>角色扮演采样与输出效率参数</h4>
+              <div class="button-row-inline">
+                <button type="button" class="btn btn-ghost btn-xs sampling-preset-btn" data-preset="balanced">均衡扮演</button>
+                <button type="button" class="btn btn-ghost btn-xs sampling-preset-btn" data-preset="creative">细腻文风</button>
+                <button type="button" class="btn btn-ghost btn-xs sampling-preset-btn" data-preset="faithful">严谨设定</button>
+              </div>
+            </div>
+            <div class="grid-3col">
+              <div class="form-group">
+                <label for="llama-temperature">Temperature</label>
+                <input type="number" id="llama-temperature" min="0" max="2" step="0.05" value="0.8" />
+              </div>
+              <div class="form-group">
+                <label for="llama-top-p">Top-P</label>
+                <input type="number" id="llama-top-p" min="0.05" max="1" step="0.05" value="0.9" />
+              </div>
+              <div class="form-group">
+                <label for="llama-min-p">Min-P (推荐 0.05)</label>
+                <input type="number" id="llama-min-p" min="0" max="1" step="0.01" value="0.05" />
+              </div>
+            </div>
+            <div class="grid-4col">
+              <div class="form-group">
+                <label for="llama-repeat-penalty">防复读惩罚</label>
+                <input type="number" id="llama-repeat-penalty" min="0.5" max="2" step="0.02" value="1.12" />
+              </div>
+              <div class="form-group">
+                <label for="llama-presence-penalty">多样性惩罚</label>
+                <input type="number" id="llama-presence-penalty" min="-2" max="2" step="0.05" value="0.1" />
+              </div>
+              <div class="form-group">
+                <label for="llama-max-tokens">最大 Tokens</label>
+                <input type="number" id="llama-max-tokens" min="1" max="8192" value="512" />
+              </div>
+              <div class="form-group">
+                <label for="llama-max-history">历史轮数</label>
+                <input type="number" id="llama-max-history" min="1" max="100" value="20" />
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <h4>本地库目录配置（通用路径管理）</h4>
+            <div class="grid-2col">
+              <div class="form-group">
+                <label for="cfg-engine-dir">引擎扫描目录 (engine_dir)</label>
+                <input type="text" id="cfg-engine-dir" placeholder="engines" />
+              </div>
+              <div class="form-group">
+                <label for="cfg-models-dir">模型扫描目录 (models_dir)</label>
+                <input type="text" id="cfg-models-dir" placeholder="models" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="cfg-skill-dirs">角色 Skill 库目录列表（每行一个，支持相对或绝对路径）</label>
+              <textarea id="cfg-skill-dirs" rows="2" placeholder="skills"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: Post-Turn Scene T2I Extension -->
+        <div id="tab-t2i" class="tab-pane">
+          <div class="settings-card">
+            <div class="card-title-row">
+              <h4>场景文生图扩展接口 (T2I Hook)</h4>
+              <span id="t2i-status-badge" class="pill pill-muted">未启用</span>
+            </div>
+            <label class="checkbox-label">
+              <input type="checkbox" id="t2i-enabled" />
+              <span>每轮角色回复完成后触发场景文生图扩展钩子</span>
+            </label>
+            <div class="grid-2col">
+              <div class="form-group">
+                <label for="t2i-active-plugin">启用插件 (Active Plugin)</label>
+                <select id="t2i-active-plugin">
+                  <option value="noop">noop (默认不调用模型)</option>
+                  <option value="example_stub">example_stub (演练提示词合成桩)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="t2i-context-turns">场景上下文轮数</label>
+                <input type="number" id="t2i-context-turns" min="1" max="20" value="4" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="t2i-plugin-settings">插件自定义参数 (JSON)</label>
+              <textarea id="t2i-plugin-settings" rows="3" placeholder='{"style": "anime"}'>{}</textarea>
+            </div>
+            <div class="summary-box">
+              <div class="summary-line">
+                <strong>最近一次 Hook 状态：</strong>
+                <span id="t2i-last-status">尚未触发</span>
+              </div>
+              <div id="t2i-last-prompt" class="status-detail"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-close-modal="settings-modal">取消</button>
+        <button type="button" id="btn-save-config" class="btn btn-primary">保存全部配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Theme Customizer Modal -->
+  <div id="theme-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="theme-modal-title">
+    <div class="modal-dialog modal-md">
+      <div class="modal-header">
+        <h3 id="theme-modal-title">外观与主题定制</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="theme-modal" aria-label="关闭">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-card">
+          <h4>预设主题</h4>
+          <div class="theme-preset-grid" id="theme-preset-grid">
+            <button type="button" class="theme-preset-card" data-preset="cafe">
+              <span class="swatch-pair"><i style="background:#15110e"></i><i style="background:#d4955a"></i></span>
+              <strong>深夜咖啡馆</strong>
+              <small>深烘暖棕 · 焦糖琥珀</small>
+            </button>
+            <button type="button" class="theme-preset-card" data-preset="cyanotype">
+              <span class="swatch-pair"><i style="background:#eff4f8"></i><i style="background:#2c648a"></i></span>
+              <strong>花青素宣</strong>
+              <small>月白青瓷 · 雅致花青</small>
+            </button>
+            <button type="button" class="theme-preset-card" data-preset="parchment">
+              <span class="swatch-pair"><i style="background:#f5efe4"></i><i style="background:#9a5b32"></i></span>
+              <strong>暖色羊皮纸</strong>
+              <small>轻小说纸质阅读感</small>
+            </button>
+            <button type="button" class="theme-preset-card" data-preset="sakura">
+              <span class="swatch-pair"><i style="background:#17121a"></i><i style="background:#e57ba8"></i></span>
+              <strong>绯樱暮雪</strong>
+              <small>柔和二次元暗粉</small>
+            </button>
+            <button type="button" class="theme-preset-card" data-preset="emerald">
+              <span class="swatch-pair"><i style="background:#0c1513"></i><i style="background:#2cb67d"></i></span>
+              <strong>幽林秘境</strong>
+              <small>护眼低饱和深绿</small>
+            </button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <h4>自定义配色与排版</h4>
+          <div class="grid-3col">
+            <div class="form-group">
+              <label for="theme-accent-color">主题强调色</label>
+              <input type="color" id="theme-accent-color" value="#d4955a" />
+            </div>
+            <div class="form-group">
+              <label for="theme-bg-color">主背景色</label>
+              <input type="color" id="theme-bg-color" value="#15110e" />
+            </div>
+            <div class="form-group">
+              <label for="theme-surface-color">卡片表面色</label>
+              <input type="color" id="theme-surface-color" value="#221c17" />
+            </div>
+          </div>
+          <div class="grid-2col">
+            <div class="form-group">
+              <label for="theme-font-size">正文字号 (<span id="theme-font-size-val">15</span>px)</label>
+              <input type="range" id="theme-font-size" min="13" max="19" step="1" value="15" />
+            </div>
+            <div class="form-group">
+              <label for="theme-chat-width">对话区宽度</label>
+              <select id="theme-chat-width">
+                <option value="700px">紧凑 (700px)</option>
+                <option value="820px" selected>标准 (820px)</option>
+                <option value="980px">宽屏 (980px)</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid-2col">
+            <div class="form-group">
+              <label for="theme-layout-style">对话呈现风格</label>
+              <select id="theme-layout-style">
+                <option value="bubble">现代对话气泡</option>
+                <option value="novel">轻小说剧场流式</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="theme-font-family">字体风格</label>
+              <select id="theme-font-family">
+                <option value="sans">现代无衬线</option>
+                <option value="serif">文学衬线体</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" id="btn-reset-theme" class="btn btn-ghost">恢复默认主题</button>
+        <button type="button" class="btn btn-primary" data-close-modal="theme-modal">完成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image Lightbox Modal -->
+  <div id="lightbox-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <img id="lightbox-img" class="lightbox-img" alt="图片预览" />
   </div>
 
   <script src="/static/app.js"></script>

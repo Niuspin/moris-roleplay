@@ -451,6 +451,10 @@ class SkillLoader:
 
         try:
             expanded = raw_path.expanduser()
+            if not expanded.is_absolute() and not expanded.exists():
+                repo_cand = Path(__file__).resolve().parent.parent / expanded
+                if repo_cand.exists():
+                    expanded = repo_cand
             exists = expanded.exists()
             resolved = expanded.resolve() if exists else expanded
         except OSError as exc:

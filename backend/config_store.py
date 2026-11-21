@@ -26,8 +26,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_prompt_chars": 0,
         "library_dirs": [
             "skills",
-            r"C:\Users\nzp18\Desktop\角色skill",
         ],
+        "user_name": "旅者",
+        "user_persona": "",
+        "scenario": "",
+        "authors_note": "",
+        "authors_note_depth": 2,
+        "immersion_mode": False,
     },
     "llama": {
         "engine_mode": "managed_server",
@@ -46,6 +51,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "request_timeout_sec": 120,
         "temperature": 0.8,
         "top_p": 0.9,
+        "min_p": 0.05,
+        "repeat_penalty": 1.12,
+        "presence_penalty": 0.1,
+        "cache_prompt": True,
         "max_tokens": 512,
         "max_history_turns": 20,
     },
@@ -183,8 +192,29 @@ def _require_dict(value: Any, field: str) -> dict[str, Any]:
 
 
 _OPTIONAL_EXTENDED_KEYS: dict[str, frozenset[str]] = {
-    "skill": frozenset({"library_dirs"}),
-    "llama": frozenset({"engine_dir", "models_dir", "mmproj_path", "multimodal_enabled"}),
+    "skill": frozenset(
+        {
+            "library_dirs",
+            "user_name",
+            "user_persona",
+            "scenario",
+            "authors_note",
+            "authors_note_depth",
+            "immersion_mode",
+        }
+    ),
+    "llama": frozenset(
+        {
+            "engine_dir",
+            "models_dir",
+            "mmproj_path",
+            "multimodal_enabled",
+            "min_p",
+            "repeat_penalty",
+            "presence_penalty",
+            "cache_prompt",
+        }
+    ),
 }
 
 
@@ -255,6 +285,26 @@ def _validate_config(data: Any) -> dict[str, Any]:
                 field="skill.library_dirs",
                 http_status=400,
             )
+    if "user_name" in skill:
+        _require_str(skill["user_name"], "skill.user_name", non_empty=False)
+    if "user_persona" in skill:
+        _require_str(skill["user_persona"], "skill.user_persona", non_empty=False)
+    if "scenario" in skill:
+        _require_str(skill["scenario"], "skill.scenario", non_empty=False)
+    if "authors_note" in skill:
+        _require_str(skill["authors_note"], "skill.authors_note", non_empty=False)
+    if "authors_note_depth" in skill:
+        an_depth = _require_int(skill["authors_note_depth"], "skill.authors_note_depth")
+        if an_depth < 0 or an_depth > 20:
+            raise ConfigError(
+                code="CONFIG_VALIDATION_ERROR",
+                message="Field 'skill.authors_note_depth' must be between 0 and 20.",
+                detail=f"Got {an_depth}.",
+                field="skill.authors_note_depth",
+                http_status=400,
+            )
+    if "immersion_mode" in skill:
+        _require_bool(skill["immersion_mode"], "skill.immersion_mode")
 
     # llama
     llama = root["llama"]
@@ -416,6 +466,38 @@ def _validate_config(data: Any) -> dict[str, Any]:
             field="llama.top_p",
             http_status=400,
         )
+    if "min_p" in llama:
+        min_p = _require_number(llama["min_p"], "llama.min_p")
+        if not (0.0 <= min_p <= 1.0):
+            raise ConfigError(
+                code="CONFIG_VALIDATION_ERROR",
+                message="Field 'llama.min_p' must be between 0.0 and 1.0.",
+                detail=f"Got {min_p}.",
+                field="llama.min_p",
+                http_status=400,
+            )
+    if "repeat_penalty" in llama:
+        repeat_penalty = _require_number(llama["repeat_penalty"], "llama.repeat_penalty")
+        if not (0.5 <= repeat_penalty <= 2.0):
+            raise ConfigError(
+                code="CONFIG_VALIDATION_ERROR",
+                message="Field 'llama.repeat_penalty' must be between 0.5 and 2.0.",
+                detail=f"Got {repeat_penalty}.",
+                field="llama.repeat_penalty",
+                http_status=400,
+            )
+    if "presence_penalty" in llama:
+        presence_penalty = _require_number(llama["presence_penalty"], "llama.presence_penalty")
+        if not (-2.0 <= presence_penalty <= 2.0):
+            raise ConfigError(
+                code="CONFIG_VALIDATION_ERROR",
+                message="Field 'llama.presence_penalty' must be between -2.0 and 2.0.",
+                detail=f"Got {presence_penalty}.",
+                field="llama.presence_penalty",
+                http_status=400,
+            )
+    if "cache_prompt" in llama:
+        _require_bool(llama["cache_prompt"], "llama.cache_prompt")
     max_tokens = _require_int(llama["max_tokens"], "llama.max_tokens")
     if max_tokens < 1:
         raise ConfigError(

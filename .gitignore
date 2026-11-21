@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 *.tmp
 config.json
+sessions/
+.desktop_profile/
 
 # Large local model weights (.gguf) - keep directory structure & READMEs
 models/**/*.gguf

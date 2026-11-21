@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import dataclasses
 import http.client
 import json
@@ -70,6 +71,7 @@ else:
     )
     _ALLOWED_WIN_SUFFIXES = frozenset()
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 _STDERR_RING_MAXLINES = 200
 _CLI_INLINE_PROMPT_LIMIT = 8000
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -78,6 +80,194 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 
 _MANAGED_ENGINES: weakref.WeakSet[LlamaServerEngine] = weakref.WeakSet()
 _MANAGED_ENGINES_LOCK = threading.Lock()
+_JOB_LOCK = threading.Lock()
+_KILL_JOB_HANDLE: int | None = None
+
+
+def _ensure_kill_on_close_job() -> int | None:
+    """Create a process-wide Windows Job Object that kills child processes if Python exits abruptly."""
+    global _KILL_JOB_HANDLE
+    if os.name != "nt":
+        return None
+    with _JOB_LOCK:
+        if _KILL_JOB_HANDLE is not None:
+            return _KILL_JOB_HANDLE
+        try:
+            kernel32 = ctypes.windll.kernel32
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+
+            class _IO_COUNTERS(ctypes.Structure):
+                _fields_ = [("ReadOperationCount", ctypes.c_uint64),
+                            ("WriteOperationCount", ctypes.c_uint64),
+                            ("OtherOperationCount", ctypes.c_uint64),
+                            ("ReadTransferCount", ctypes.c_uint64),
+                            ("WriteTransferCount", ctypes.c_uint64),
+                            ("OtherTransferCount", ctypes.c_uint64)]
+
+            class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                            ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", ctypes.c_uint32),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", ctypes.c_uint32),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", ctypes.c_uint32),
+                            ("SchedulingClass", ctypes.c_uint32)]
+
+            class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                            ("IoInfo", _IO_COUNTERS),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = kernel32.SetInformationJobObject(
+                job,
+                9,  # JobObjectExtendedLimitInformation
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                kernel32.CloseHandle(job)
+                return None
+            _KILL_JOB_HANDLE = int(job)
+            return _KILL_JOB_HANDLE
+        except Exception:
+            return None
+
+
+def _assign_proc_to_kill_job(proc: subprocess.Popen[Any]) -> None:
+    if os.name != "nt":
+        return
+    job = _ensure_kill_on_close_job()
+    if not job:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x0200 | 0x0001 | 0x1000, False, int(proc.pid))  # SET_QUOTA | TERMINATE | QUERY_LIMITED
+        if handle:
+            try:
+                kernel32.AssignProcessToJobObject(job, handle)
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _find_listening_pid_on_port(port: int) -> int | None:
+    """Return PID of local TCP listener on port if detectable."""
+    if os.name != "nt":
+        return None
+    try:
+        res = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            creationflags=_CREATE_NO_WINDOW,
+            check=False,
+        )
+        suffix = f":{port}"
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+                local_addr = parts[1]
+                if local_addr.endswith(suffix):
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return None
+
+
+def _query_process_exe_path(pid: int) -> Path | None:
+    """Return executable Path for a Windows PID using QueryFullProcessImageNameW."""
+    if os.name != "nt" or pid <= 0:
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_uint32(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return Path(buf.value).resolve()
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return None
+
+
+def reclaim_orphan_project_engine(port: int, engines_dir: str | Path | None = None) -> int | None:
+    """Terminate an orphaned llama-server process belonging to this project's engines/ dir on port.
+
+    Returns the reclaimed PID if terminated, or None if port is not held by a project engine.
+    """
+    pid = _find_listening_pid_on_port(port)
+    if pid is None or pid == os.getpid():
+        return None
+    exe_path = _query_process_exe_path(pid)
+    if exe_path is None:
+        return None
+    if exe_path.name.lower() not in {n.lower() for n in _SERVER_BIN_CANDIDATES}:
+        return None
+
+    roots_to_check: list[Path] = [(_REPO_ROOT / "engines").resolve()]
+    if engines_dir:
+        ed = Path(engines_dir).expanduser()
+        if not ed.is_absolute():
+            ed = _REPO_ROOT / ed
+        try:
+            roots_to_check.append(ed.resolve())
+        except OSError:
+            pass
+
+    belongs_to_project = False
+    for root in roots_to_check:
+        try:
+            exe_path.relative_to(root)
+            belongs_to_project = True
+            break
+        except ValueError:
+            continue
+
+    if not belongs_to_project:
+        return None
+
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=5,
+                creationflags=_CREATE_NO_WINDOW,
+                check=False,
+            )
+        else:
+            os.kill(pid, 15)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                probe_tcp_port_available("127.0.0.1", port)
+                break
+            except EngineError:
+                time.sleep(0.1)
+        return pid
+    except Exception:
+        return None
 
 
 def _shutdown_all_managed_engines() -> None:
@@ -162,6 +352,31 @@ class LlamaEngine(ABC):
     ) -> dict[str, Any]:
         """Execute a chat completion request and return a normalized response dict."""
 
+    def chat_completion_stream(
+        self,
+        messages: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        """Yield streaming completion events ({type: 'delta'|'done', ...}).
+
+        Subclasses can override for true token-by-token streaming; the default
+        implementation falls back to chat_completion() for full compatibility.
+        """
+        res = self.chat_completion(messages, params)
+        reply = str(res.get("reply", ""))
+        if reply and not (cancel_event is not None and cancel_event.is_set()):
+            yield {"type": "delta", "content": reply}
+        yield {
+            "type": "done",
+            "reply": reply,
+            "usage": res.get("usage", {}) if isinstance(res.get("usage"), dict) else {},
+            "model": str(res.get("model") or ""),
+            "finish_reason": str(res.get("finish_reason") or "stop"),
+            "aborted": bool(cancel_event is not None and cancel_event.is_set()),
+            "timings": res.get("timings", {}) if isinstance(res.get("timings"), dict) else {},
+        }
+
     @abstractmethod
     def shutdown(self) -> None:
         """Release any managed process or runtime resources idempotently."""
@@ -207,6 +422,10 @@ def resolve_executable(raw_path: str, candidates: tuple[str, ...]) -> Path:
         )
 
     path = Path(cleaned).expanduser()
+    if not path.is_absolute() and not path.exists():
+        repo_cand = _REPO_ROOT / path
+        if repo_cand.exists():
+            path = repo_cand
     if not path.exists():
         raise EngineError(
             "ENGINE_BINARY_NOT_FOUND",
@@ -265,6 +484,10 @@ def validate_gguf_model(raw_path: str) -> Path:
         )
 
     path = Path(cleaned).expanduser()
+    if not path.is_absolute() and not path.exists():
+        repo_cand = _REPO_ROOT / path
+        if repo_cand.exists():
+            path = repo_cand
     if not path.exists():
         raise EngineError(
             "MODEL_FILE_INVALID",
@@ -579,6 +802,10 @@ class LlamaServerEngine(LlamaEngine):
         self.request_timeout_sec: float = float(cfg.get("request_timeout_sec", 120))
         self.temperature: float = float(cfg.get("temperature", 0.8))
         self.top_p: float = float(cfg.get("top_p", 0.9))
+        self.min_p: float = float(cfg.get("min_p", 0.05))
+        self.repeat_penalty: float = float(cfg.get("repeat_penalty", 1.12))
+        self.presence_penalty: float = float(cfg.get("presence_penalty", 0.1))
+        self.cache_prompt: bool = bool(cfg.get("cache_prompt", True))
         self.max_tokens: int = int(cfg.get("max_tokens", 512))
 
         if self.mode == "managed_server":
@@ -836,6 +1063,7 @@ class LlamaServerEngine(LlamaEngine):
                     bufsize=1,
                     creationflags=_CREATE_NO_WINDOW,
                 )
+                _assign_proc_to_kill_job(proc)
             except (FileNotFoundError, PermissionError, OSError) as exc:
                 err = EngineError(
                     "ENGINE_BINARY_NOT_FOUND",
@@ -978,26 +1206,43 @@ class LlamaServerEngine(LlamaEngine):
             )
             return err
 
-    def chat_completion(
+    def _build_completion_payload(
         self,
-        messages: list[dict[str, str]],
-        params: dict[str, Any] | None = None,
+        normalized_messages: list[dict[str, Any]],
+        *,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        params: Mapping[str, Any] | None,
+        stream: bool,
     ) -> dict[str, Any]:
-        normalized_messages = _validate_messages(messages)
-        temperature, top_p, max_tokens = _validate_sampling_params(
-            params,
-            default_temperature=self.temperature,
-            default_top_p=self.top_p,
-            default_max_tokens=self.max_tokens,
-        )
+        p = params if isinstance(params, Mapping) else {}
+        min_p = float(p.get("min_p", self.min_p))
+        repeat_penalty = float(p.get("repeat_penalty", self.repeat_penalty))
+        presence_penalty = float(p.get("presence_penalty", self.presence_penalty))
+        cache_prompt = bool(p.get("cache_prompt", self.cache_prompt))
 
+        payload: dict[str, Any] = {
+            "messages": normalized_messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "min_p": min_p,
+            "repeat_penalty": repeat_penalty,
+            "presence_penalty": presence_penalty,
+            "max_tokens": max_tokens,
+            "cache_prompt": cache_prompt,
+            "stream": stream,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        return payload
+
+    def _prepare_active_server(self) -> tuple[subprocess.Popen[str] | None, int | None]:
         active_proc: subprocess.Popen[str] | None = None
         if self.mode == "managed_server":
             with self._lifecycle_lock:
                 proc = self._proc
                 if proc is None:
                     needs_start = True
-                    exited_rc = None
                 else:
                     exited_rc = proc.poll()
                     needs_start = False
@@ -1046,22 +1291,6 @@ class LlamaServerEngine(LlamaEngine):
                 )
                 raise
 
-        payload = {
-            "messages": normalized_messages,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        body_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.endpoint}/v1/chat/completions",
-            data=body_bytes,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-
         with self._state_lock:
             if self.mode == "managed_server" and (
                 active_proc is None or self._proc is not active_proc or self._status.state == "stopped"
@@ -1076,6 +1305,37 @@ class LlamaServerEngine(LlamaEngine):
                 if active_proc is not None and active_proc.poll() is None
                 else None
             )
+        return active_proc, current_pid
+
+    def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_messages = _validate_messages(messages)
+        temperature, top_p, max_tokens = _validate_sampling_params(
+            params,
+            default_temperature=self.temperature,
+            default_top_p=self.top_p,
+            default_max_tokens=self.max_tokens,
+        )
+
+        active_proc, current_pid = self._prepare_active_server()
+        payload = self._build_completion_payload(
+            normalized_messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            params=params,
+            stream=False,
+        )
+        body_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.endpoint}/v1/chat/completions",
+            data=body_bytes,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
 
         request_timeout = max(0.05, float(self.request_timeout_sec))
         try:
@@ -1220,11 +1480,218 @@ class LlamaServerEngine(LlamaEngine):
                     detail="",
                 )
 
+        timings = data.get("timings")
         return {
             "reply": content,
             "usage": usage,
             "model": str(data.get("model") or ""),
             "finish_reason": str(first_choice.get("finish_reason") or "stop"),
+            "timings": dict(timings) if isinstance(timings, dict) else {},
+        }
+
+    def chat_completion_stream(
+        self,
+        messages: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        normalized_messages = _validate_messages(messages)
+        temperature, top_p, max_tokens = _validate_sampling_params(
+            params,
+            default_temperature=self.temperature,
+            default_top_p=self.top_p,
+            default_max_tokens=self.max_tokens,
+        )
+
+        active_proc, current_pid = self._prepare_active_server()
+        payload = self._build_completion_payload(
+            normalized_messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            params=params,
+            stream=True,
+        )
+        body_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.endpoint}/v1/chat/completions",
+            data=body_bytes,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+
+        request_timeout = max(0.05, float(self.request_timeout_sec))
+        chunks: list[str] = []
+        usage: dict[str, Any] = {}
+        timings: dict[str, Any] = {}
+        model_name = ""
+        finish_reason = "stop"
+        aborted = False
+
+        try:
+            with _open_url(req, timeout=request_timeout) as resp:
+                content_type = str(resp.headers.get("Content-Type", "")).lower()
+                # If upstream server ignored stream=True and returned plain JSON, handle gracefully
+                if "application/json" in content_type and "text/event-stream" not in content_type:
+                    raw_resp = resp.read()
+                    data = json.loads(raw_resp.decode("utf-8"))
+                    choices = data.get("choices") if isinstance(data, dict) else None
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        msg_obj = choices[0].get("message")
+                        text_val = msg_obj.get("content") if isinstance(msg_obj, dict) else choices[0].get("text")
+                        if isinstance(text_val, str) and text_val:
+                            chunks.append(text_val)
+                            yield {"type": "delta", "content": text_val}
+                        finish_reason = str(choices[0].get("finish_reason") or "stop")
+                    if isinstance(data, dict):
+                        if isinstance(data.get("usage"), dict):
+                            usage = dict(data["usage"])
+                        if isinstance(data.get("timings"), dict):
+                            timings = dict(data["timings"])
+                        model_name = str(data.get("model") or "")
+                else:
+                    for raw_line in resp:
+                        if cancel_event is not None and cancel_event.is_set():
+                            aborted = True
+                            finish_reason = "aborted"
+                            break
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            frame = json.loads(data_str)
+                        except ValueError:
+                            continue
+                        if not isinstance(frame, dict):
+                            continue
+                        if not model_name and frame.get("model"):
+                            model_name = str(frame.get("model"))
+                        if isinstance(frame.get("usage"), dict):
+                            usage = dict(frame["usage"])
+                        if isinstance(frame.get("timings"), dict):
+                            timings = dict(frame["timings"])
+
+                        choices = frame.get("choices")
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            c0 = choices[0]
+                            if c0.get("finish_reason"):
+                                finish_reason = str(c0["finish_reason"])
+                            delta = c0.get("delta")
+                            piece = ""
+                            if isinstance(delta, dict):
+                                raw_c = delta.get("content")
+                                if isinstance(raw_c, str) and raw_c:
+                                    piece = raw_c
+                            elif isinstance(c0.get("text"), str) and c0["text"]:
+                                piece = c0["text"]
+                            if piece:
+                                chunks.append(piece)
+                                yield {"type": "delta", "content": piece}
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = _decode_bytes(exc.read())
+            except Exception:
+                err_body = str(exc.reason or "")
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+            if exc.code == 503:
+                err = EngineError(
+                    "ENGINE_LOADING",
+                    "llama-server is currently loading the model.",
+                    http_status=503,
+                    detail=err_body or "HTTP 503 Service Unavailable",
+                )
+            else:
+                err = EngineError(
+                    "ENGINE_UPSTREAM_ERROR",
+                    f"llama-server returned HTTP {exc.code}.",
+                    http_status=502,
+                    detail=err_body or str(exc.reason or ""),
+                )
+            raise self._finalize_chat_error(active_proc, current_pid, err) from exc
+        except TimeoutError as exc:
+            err = EngineError(
+                "ENGINE_TIMEOUT",
+                "Timed out waiting for llama-server streaming response.",
+                http_status=504,
+                detail=str(exc),
+            )
+            raise self._finalize_chat_error(active_proc, current_pid, err) from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                err = EngineError(
+                    "ENGINE_TIMEOUT",
+                    "Timed out waiting for llama-server streaming response.",
+                    http_status=504,
+                    detail=str(exc.reason),
+                )
+            else:
+                err = EngineError(
+                    "ENGINE_UPSTREAM_ERROR",
+                    "Failed to connect to llama-server.",
+                    http_status=502,
+                    detail=str(exc.reason or exc),
+                )
+            raise self._finalize_chat_error(active_proc, current_pid, err) from exc
+        except (http.client.HTTPException, OSError) as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                aborted = True
+                finish_reason = "aborted"
+            else:
+                err = EngineError(
+                    "ENGINE_UPSTREAM_ERROR",
+                    "Connection error while streaming from llama-server.",
+                    http_status=502,
+                    detail=str(exc),
+                )
+                raise self._finalize_chat_error(active_proc, current_pid, err) from exc
+
+        with self._state_lock:
+            if self.mode == "managed_server":
+                if (
+                    active_proc is not None
+                    and self._proc is active_proc
+                    and self._status.state != "stopped"
+                ):
+                    alive_pid = active_proc.pid if active_proc.poll() is None else None
+                    self._status = EngineStatus(
+                        state="ready",
+                        mode=self.mode,
+                        endpoint=self.endpoint,
+                        pid=alive_pid,
+                        error_code="",
+                        detail="",
+                    )
+            else:
+                self._status = EngineStatus(
+                    state="ready",
+                    mode=self.mode,
+                    endpoint=self.endpoint,
+                    pid=None,
+                    error_code="",
+                    detail="",
+                )
+
+        yield {
+            "type": "done",
+            "reply": "".join(chunks),
+            "usage": usage,
+            "model": model_name,
+            "finish_reason": finish_reason,
+            "aborted": aborted,
+            "timings": timings,
         }
 
     def shutdown(self) -> None:
@@ -1247,6 +1714,10 @@ class LlamaCliEngine(LlamaEngine):
         self.request_timeout_sec: float = float(cfg.get("request_timeout_sec", 120))
         self.temperature: float = float(cfg.get("temperature", 0.8))
         self.top_p: float = float(cfg.get("top_p", 0.9))
+        self.min_p: float = float(cfg.get("min_p", 0.05))
+        self.repeat_penalty: float = float(cfg.get("repeat_penalty", 1.12))
+        self.presence_penalty: float = float(cfg.get("presence_penalty", 0.1))
+        self.cache_prompt: bool = bool(cfg.get("cache_prompt", True))
         self.max_tokens: int = int(cfg.get("max_tokens", 512))
 
         self._lock = threading.Lock()

@@ -9,9 +9,14 @@
     "exclude_meta_docs": false,
     "max_prompt_chars": 0,
     "library_dirs": [
-      "skills",
-      "C:\\Users\\nzp18\\Desktop\\角色skill"
-    ]
+      "skills"
+    ],
+    "user_name": "旅者",
+    "user_persona": "",
+    "scenario": "",
+    "authors_note": "",
+    "authors_note_depth": 2,
+    "immersion_mode": false
   },
   "llama": {
     "engine_mode": "managed_server",
@@ -30,6 +35,10 @@
     "request_timeout_sec": 120,
     "temperature": 0.8,
     "top_p": 0.9,
+    "min_p": 0.05,
+    "repeat_penalty": 1.12,
+    "presence_penalty": 0.1,
+    "cache_prompt": true,
     "max_tokens": 512,
     "max_history_turns": 20
   },

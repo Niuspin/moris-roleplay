@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENGINES_DIR = REPO_ROOT / "engines"
 DEFAULT_MODELS_DIR = REPO_ROOT / "models"
 DEFAULT_SKILLS_DIR = REPO_ROOT / "skills"
-DESKTOP_SKILLS_DIR = Path(r"C:\Users\nzp18\Desktop\角色skill")
+DESKTOP_SKILLS_DIR = Path.home() / "Desktop" / "角色skill"
 
 _SERVER_EXE_NAMES = frozenset(
     {

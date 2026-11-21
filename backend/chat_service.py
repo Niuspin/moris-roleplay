@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 import inspect
+import json
 import math
+import os
+import re
+import tempfile
 import threading
 import time
 import uuid
@@ -17,6 +21,15 @@ from typing import Any
 from backend.extensions.t2i import SceneContext
 from backend.llama_engine import EngineStatus
 from backend.skill_loader import SkillLoader, SkillLoadError, SkillLoadResult
+
+_SAFE_SID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+_IMMERSION_DIRECTIVE = (
+    "【沉浸式角色扮演指引】\n"
+    "1. 全程保持角色设定中的性格、语气、口癖、知识边界与世界观，绝不跳戏或提及自己是 AI、语言模型或助手。\n"
+    "2. 自然融入动作、神态、眼神、停顿与环境氛围描写（可使用 *动作或心理描写* 与对话结合），让场景具有画面感与情绪张力。\n"
+    "3. 根据对方的言行产生真实的情感递进与记忆连贯，避免机械复读上一轮句式。"
+)
 
 _ENGINE_BINDING_KEYS: tuple[str, ...] = (
     "engine_mode",
@@ -67,6 +80,11 @@ class ChatSession:
     session_id: str
     messages: list[dict[str, str]] = field(default_factory=list)
     turn_index: int = 0
+    title: str = ""
+    character_name: str = ""
+    updated_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -168,6 +186,7 @@ class ChatService:
         config_store: Any,
         skill_loader: Any = SkillLoader,
         t2i_dispatcher: Any = None,
+        sessions_dir: str | Path | None = None,
     ) -> None:
         if hasattr(engine_factory_or_engine, "chat_completion") and hasattr(
             engine_factory_or_engine, "status"
@@ -185,12 +204,15 @@ class ChatService:
         self._config_store = config_store
         self._skill_loader = skill_loader
         self._t2i_dispatcher = t2i_dispatcher
+        self._sessions_dir: Path | None = Path(sessions_dir) if sessions_dir is not None else None
 
         self._state_lock = threading.RLock()
         self._engine_lock = threading.RLock()
         self._sessions: dict[str, ChatSession] = {}
         self._current_skill: SkillLoadResult | None = None
         self._engine_fingerprint: tuple[tuple[str, Any], ...] | None = None
+        if self._sessions_dir is not None:
+            self._load_persisted_sessions()
 
     @staticmethod
     def _compute_engine_fingerprint(cfg: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
@@ -358,16 +380,239 @@ class ChatService:
         self._safe_shutdown_engine(engine)
 
     # ------------------------------------------------------------------
-    # Session & multi-turn chat
+    # Session persistence & management
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _session_file_path(self, session_id: str) -> Path | None:
+        if self._sessions_dir is None:
+            return None
+        safe_id = _SAFE_SID_RE.sub("_", session_id).strip("._") or "session"
+        return self._sessions_dir / f"{safe_id[:96]}.json"
+
+    def _load_persisted_sessions(self) -> None:
+        if self._sessions_dir is None or not self._sessions_dir.is_dir():
+            return
+        try:
+            files = sorted(self._sessions_dir.glob("*.json"))
+        except OSError:
+            return
+        for fpath in files:
+            try:
+                raw = json.loads(fpath.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+                sid = str(raw.get("session_id") or "").strip()
+                if not sid:
+                    continue
+                raw_msgs = raw.get("messages")
+                msgs: list[dict[str, str]] = []
+                if isinstance(raw_msgs, list):
+                    for m in raw_msgs:
+                        if isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), str):
+                            msgs.append({"role": m["role"], "content": m["content"]})
+                sess = ChatSession(
+                    session_id=sid,
+                    messages=msgs,
+                    turn_index=int(raw.get("turn_index") or (len(msgs) // 2)),
+                    title=str(raw.get("title") or ""),
+                    character_name=str(raw.get("character_name") or ""),
+                    updated_at=str(raw.get("updated_at") or self._now_iso()),
+                )
+                with self._state_lock:
+                    self._sessions[sid] = sess
+            except Exception:
+                continue
+
+    def _persist_session(self, session: ChatSession) -> None:
+        fpath = self._session_file_path(session.session_id)
+        if fpath is None:
+            return
+        payload = {
+            "session_id": session.session_id,
+            "title": session.title,
+            "character_name": session.character_name,
+            "turn_index": session.turn_index,
+            "updated_at": session.updated_at,
+            "messages": [{"role": m["role"], "content": m["content"]} for m in session.messages],
+        }
+        tmp_path: str | None = None
+        try:
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=fpath.parent,
+                prefix=f".{fpath.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_f:
+                tmp_path = tmp_f.name
+                tmp_f.write(serialized)
+                tmp_f.flush()
+            os.replace(tmp_path, fpath)
+            tmp_path = None
+        except OSError:
+            pass
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _delete_persisted_session_file(self, session_id: str) -> None:
+        fpath = self._session_file_path(session_id)
+        if fpath is not None:
+            try:
+                fpath.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _get_or_create_session(self, session_id: str) -> ChatSession:
         with self._state_lock:
             session = self._sessions.get(session_id)
             if session is None:
-                session = ChatSession(session_id=session_id)
+                char_name = self._current_skill.character_name if self._current_skill is not None else ""
+                session = ChatSession(
+                    session_id=session_id,
+                    character_name=char_name,
+                    updated_at=self._now_iso(),
+                )
                 self._sessions[session_id] = session
             return session
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """Return metadata for all sessions sorted by most recently updated."""
+        with self._state_lock:
+            sessions = list(self._sessions.values())
+        summaries: list[dict[str, Any]] = []
+        for sess in sessions:
+            with sess.lock:
+                preview = ""
+                if sess.messages:
+                    preview = sess.messages[-1]["content"][:80].replace("\n", " ").strip()
+                title = sess.title
+                if not title and sess.messages:
+                    first_user = next((m["content"] for m in sess.messages if m["role"] == "user"), "")
+                    title = first_user[:28].replace("\n", " ").strip()
+                summaries.append(
+                    {
+                        "session_id": sess.session_id,
+                        "title": title or "新对话",
+                        "character_name": sess.character_name,
+                        "turn_index": sess.turn_index,
+                        "messages_count": len(sess.messages),
+                        "updated_at": sess.updated_at,
+                        "preview": preview,
+                    }
+                )
+        summaries.sort(key=lambda item: item["updated_at"], reverse=True)
+        return summaries
+
+    def get_session_detail(self, session_id: str) -> dict[str, Any]:
+        """Return full metadata and messages for a session."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ChatError(
+                "CHAT_INVALID_SESSION_ID",
+                "Field 'session_id' must be a non-empty string.",
+                http_status=400,
+            )
+        sid = session_id.strip()
+        with self._state_lock:
+            session = self._sessions.get(sid)
+        if session is None:
+            return {
+                "session_id": sid,
+                "title": "新对话",
+                "character_name": "",
+                "turn_index": 0,
+                "messages_count": 0,
+                "updated_at": self._now_iso(),
+                "messages": [],
+            }
+        with session.lock:
+            return {
+                "session_id": session.session_id,
+                "title": session.title or "新对话",
+                "character_name": session.character_name,
+                "turn_index": session.turn_index,
+                "messages_count": len(session.messages),
+                "updated_at": session.updated_at,
+                "messages": [dict(m) for m in session.messages],
+            }
+
+    def delete_session(self, session_id: str) -> dict[str, Any]:
+        """Permanently remove a session from memory and disk."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ChatError(
+                "CHAT_INVALID_SESSION_ID",
+                "Field 'session_id' must be a non-empty string.",
+                http_status=400,
+            )
+        sid = session_id.strip()
+        with self._state_lock:
+            existed = self._sessions.pop(sid, None) is not None
+        self._delete_persisted_session_file(sid)
+        return {"status": "ok", "session_id": sid, "deleted": existed}
+
+    def edit_message(self, session_id: str, index: int, content: str) -> dict[str, Any]:
+        """Edit the text content of a specific message in a session."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ChatError("CHAT_INVALID_SESSION_ID", "Field 'session_id' must be a non-empty string.", http_status=400)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ChatError("CHAT_INVALID_ARGUMENT", "Field 'index' must be a non-negative integer.", http_status=400)
+        if not isinstance(content, str) or not content.strip():
+            raise ChatError("CHAT_INVALID_MESSAGE", "Field 'content' must be a non-empty string.", http_status=400)
+        sid = session_id.strip()
+        with self._state_lock:
+            session = self._sessions.get(sid)
+        if session is None:
+            raise ChatError("SESSION_NOT_FOUND", f"Session '{sid}' not found.", http_status=404)
+        with session.lock:
+            if index >= len(session.messages):
+                raise ChatError("MESSAGE_INDEX_OUT_OF_RANGE", f"Message index {index} out of range.", http_status=400)
+            session.messages[index]["content"] = content.strip()
+            session.updated_at = self._now_iso()
+            self._persist_session(session)
+            return {
+                "status": "ok",
+                "session_id": sid,
+                "index": index,
+                "messages_count": len(session.messages),
+                "messages": [dict(m) for m in session.messages],
+            }
+
+    def delete_messages_from(self, session_id: str, index: int) -> dict[str, Any]:
+        """Truncate session history starting from message index (for roleplay rewind/branching)."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ChatError("CHAT_INVALID_SESSION_ID", "Field 'session_id' must be a non-empty string.", http_status=400)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ChatError("CHAT_INVALID_ARGUMENT", "Field 'index' must be a non-negative integer.", http_status=400)
+        sid = session_id.strip()
+        with self._state_lock:
+            session = self._sessions.get(sid)
+        if session is None:
+            raise ChatError("SESSION_NOT_FOUND", f"Session '{sid}' not found.", http_status=404)
+        with session.lock:
+            if index >= len(session.messages):
+                raise ChatError("MESSAGE_INDEX_OUT_OF_RANGE", f"Message index {index} out of range.", http_status=400)
+            del session.messages[index:]
+            session.turn_index = sum(1 for m in session.messages if m["role"] == "assistant")
+            session.updated_at = self._now_iso()
+            self._persist_session(session)
+            return {
+                "status": "ok",
+                "session_id": sid,
+                "turn_index": session.turn_index,
+                "messages_count": len(session.messages),
+                "messages": [dict(m) for m in session.messages],
+            }
 
     def reset_session(self, session_id: str | None = None) -> dict[str, Any]:
         """Clear conversation turns for one or all sessions while keeping the active skill."""
@@ -387,6 +632,8 @@ class ChatService:
                 with session.lock:
                     session.messages.clear()
                     session.turn_index = 0
+                    session.updated_at = self._now_iso()
+                    self._persist_session(session)
             return {
                 "status": "ok",
                 "session_id": sid,
@@ -403,6 +650,8 @@ class ChatService:
             with session.lock:
                 session.messages.clear()
                 session.turn_index = 0
+                session.updated_at = self._now_iso()
+                self._persist_session(session)
 
         return {
             "status": "ok",
@@ -525,14 +774,14 @@ class ChatService:
                 "extra": {"error_type": type(exc).__name__},
             }
 
-    def chat(
-        self,
+    @staticmethod
+    def _validate_chat_inputs(
+        *,
         message: str,
-        session_id: str | None = None,
-        params: dict[str, Any] | None = None,
-        images: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Process a single chat turn with prompt injection, history window, multimodal images, and T2I dispatch."""
+        session_id: str | None,
+        params: dict[str, Any] | None,
+        images: list[str] | None,
+    ) -> list[str]:
         if session_id is not None and not isinstance(session_id, str):
             raise ChatError(
                 "CHAT_INVALID_SESSION_ID",
@@ -575,7 +824,7 @@ class ChatService:
                     "Optional 'params' must be a mapping.",
                     http_status=400,
                 )
-            for float_key in ("temperature", "top_p"):
+            for float_key in ("temperature", "top_p", "min_p", "repeat_penalty", "presence_penalty"):
                 if float_key in params:
                     val = params[float_key]
                     if (
@@ -596,49 +845,122 @@ class ChatService:
                         "Parameter 'max_tokens' must be an integer >= 1.",
                         http_status=400,
                     )
+        return normalized_images
+
+    @staticmethod
+    def _build_roleplay_director_note(skill_cfg: dict[str, Any]) -> str:
+        """Assemble optional deep-roleplay guidance (immersion, persona, scenario, author's note)."""
+        sections: list[str] = []
+        if bool(skill_cfg.get("immersion_mode", False)):
+            sections.append(_IMMERSION_DIRECTIVE)
+        user_name = str(skill_cfg.get("user_name", "") or "").strip()
+        user_persona = str(skill_cfg.get("user_persona", "") or "").strip()
+        if user_persona:
+            label = f"对话对象（{user_name}）" if user_name else "对话对象"
+            sections.append(f"【{label}设定】\n{user_persona}")
+        elif user_name and sections:
+            sections.append(f"【对话对象称呼】对方名为「{user_name}」。")
+        scenario = str(skill_cfg.get("scenario", "") or "").strip()
+        if scenario:
+            sections.append(f"【当前场景与背景】\n{scenario}")
+        authors_note = str(skill_cfg.get("authors_note", "") or "").strip()
+        if authors_note:
+            sections.append(f"【导演提示 / Scene Note】\n{authors_note}")
+        return "\n\n".join(sections).strip()
+
+    def _build_messages_and_params(
+        self,
+        *,
+        session: ChatSession,
+        skill: SkillLoadResult | None,
+        cfg: dict[str, Any],
+        user_message: str,
+        normalized_images: list[str],
+        params: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        llama_cfg = cfg.get("llama", {})
+        skill_cfg = cfg.get("skill", {})
+        max_history_turns = int(llama_cfg.get("max_history_turns", 20))
+
+        messages_to_send: list[dict[str, Any]] = []
+        if skill is not None and skill.system_prompt:
+            messages_to_send.append({"role": "system", "content": skill.system_prompt})
+
+        if max_history_turns > 0 and session.messages:
+            window = session.messages[-(max_history_turns * 2) :]
+        else:
+            window = []
+        history_entries: list[dict[str, Any]] = [
+            {"role": item["role"], "content": item["content"]} for item in window
+        ]
+
+        if normalized_images:
+            user_content: str | list[dict[str, Any]] = [
+                {"type": "text", "text": user_message},
+                *[
+                    {"type": "image_url", "image_url": {"url": img_url}}
+                    for img_url in normalized_images
+                ],
+            ]
+        else:
+            user_content = user_message
+        history_entries.append({"role": "user", "content": user_content})
+
+        director_note = self._build_roleplay_director_note(skill_cfg)
+        if director_note:
+            depth = int(skill_cfg.get("authors_note_depth", 2))
+            depth = max(0, min(depth, len(history_entries)))
+            insert_pos = max(0, len(history_entries) - depth)
+            history_entries.insert(insert_pos, {"role": "system", "content": director_note})
+
+        messages_to_send.extend(history_entries)
+
+        effective_params: dict[str, Any] = {
+            "temperature": llama_cfg.get("temperature", 0.8),
+            "top_p": llama_cfg.get("top_p", 0.9),
+            "max_tokens": llama_cfg.get("max_tokens", 512),
+        }
+        for opt_key in ("min_p", "repeat_penalty", "presence_penalty", "cache_prompt"):
+            if opt_key in llama_cfg:
+                effective_params[opt_key] = llama_cfg[opt_key]
+        if params is not None:
+            effective_params.update(params)
+
+        return messages_to_send, effective_params
+
+    def chat(
+        self,
+        message: str,
+        session_id: str | None = None,
+        params: dict[str, Any] | None = None,
+        images: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Process a single chat turn with prompt injection, history window, multimodal images, and T2I dispatch."""
+        normalized_images = self._validate_chat_inputs(
+            message=message,
+            session_id=session_id,
+            params=params,
+            images=images,
+        )
 
         sid = session_id.strip() if (session_id is not None and session_id.strip()) else uuid.uuid4().hex
         session = self._get_or_create_session(sid)
 
         with session.lock:
             cfg = self._config_store.load()
-            llama_cfg = cfg.get("llama", {})
             t2i_cfg = cfg.get("t2i", {})
-            max_history_turns = int(llama_cfg.get("max_history_turns", 20))
 
             with self._state_lock:
                 skill = self._current_skill
 
-            messages_to_send: list[dict[str, Any]] = []
-            if skill is not None and skill.system_prompt:
-                messages_to_send.append({"role": "system", "content": skill.system_prompt})
-
-            if max_history_turns > 0 and session.messages:
-                window = session.messages[-(max_history_turns * 2) :]
-            else:
-                window = []
-            for item in window:
-                messages_to_send.append({"role": item["role"], "content": item["content"]})
-
-            if normalized_images:
-                user_content: str | list[dict[str, Any]] = [
-                    {"type": "text", "text": message},
-                    *[
-                        {"type": "image_url", "image_url": {"url": img_url}}
-                        for img_url in normalized_images
-                    ],
-                ]
-            else:
-                user_content = message
-            messages_to_send.append({"role": "user", "content": user_content})
-
-            effective_params: dict[str, Any] = {
-                "temperature": llama_cfg.get("temperature", 0.8),
-                "top_p": llama_cfg.get("top_p", 0.9),
-                "max_tokens": llama_cfg.get("max_tokens", 512),
-            }
-            if params is not None:
-                effective_params.update(params)
+            messages_to_send, effective_params = self._build_messages_and_params(
+                session=session,
+                skill=skill,
+                cfg=cfg,
+                user_message=message,
+                normalized_images=normalized_images,
+                params=params,
+            )
 
             engine = self._get_or_refresh_engine(cfg)
             raw_res = engine.chat_completion(messages_to_send, effective_params)
@@ -647,6 +969,13 @@ class ChatService:
             session.messages.append({"role": "user", "content": message})
             session.messages.append({"role": "assistant", "content": reply})
             session.turn_index += 1
+            if skill is not None:
+                session.character_name = skill.character_name
+            if not session.title:
+                session.title = message[:28].replace("\n", " ").strip()
+            session.updated_at = self._now_iso()
+            self._persist_session(session)
+
             turn_index = session.turn_index
             messages_count = len(session.messages)
 
@@ -669,6 +998,181 @@ class ChatService:
             "t2i_hook": t2i_hook,
             "messages_count": messages_count,
         }
+
+    def chat_stream(
+        self,
+        message: str,
+        session_id: str | None = None,
+        params: dict[str, Any] | None = None,
+        images: list[str] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        """Stream a single chat turn token-by-token as structured SSE event dicts."""
+        normalized_images = self._validate_chat_inputs(
+            message=message,
+            session_id=session_id,
+            params=params,
+            images=images,
+        )
+        sid = session_id.strip() if (session_id is not None and session_id.strip()) else uuid.uuid4().hex
+        session = self._get_or_create_session(sid)
+
+        with session.lock:
+            cfg = self._config_store.load()
+            t2i_cfg = cfg.get("t2i", {})
+            with self._state_lock:
+                skill = self._current_skill
+
+            messages_to_send, effective_params = self._build_messages_and_params(
+                session=session,
+                skill=skill,
+                cfg=cfg,
+                user_message=message,
+                normalized_images=normalized_images,
+                params=params,
+            )
+            next_turn = session.turn_index + 1
+            yield {
+                "type": "meta",
+                "session_id": sid,
+                "turn_index": next_turn,
+                "character_name": skill.character_name if skill is not None else "",
+            }
+
+            engine = self._get_or_refresh_engine(cfg)
+            started = time.perf_counter()
+            collected: list[str] = []
+            usage: dict[str, Any] = {}
+            timings: dict[str, Any] = {}
+            aborted = False
+
+            if hasattr(engine, "chat_completion_stream") and callable(engine.chat_completion_stream):
+                for ev in engine.chat_completion_stream(
+                    messages_to_send,
+                    effective_params,
+                    cancel_event=cancel_event,
+                ):
+                    ev_type = ev.get("type")
+                    if ev_type == "delta":
+                        chunk = str(ev.get("content") or "")
+                        if chunk:
+                            collected.append(chunk)
+                            yield {"type": "delta", "content": chunk}
+                    elif ev_type == "done":
+                        if not collected and ev.get("reply"):
+                            collected.append(str(ev["reply"]))
+                        if isinstance(ev.get("usage"), dict):
+                            usage = dict(ev["usage"])
+                        if isinstance(ev.get("timings"), dict):
+                            timings = dict(ev["timings"])
+                        aborted = bool(ev.get("aborted", False))
+            else:
+                raw_res = engine.chat_completion(messages_to_send, effective_params)
+                reply_fallback, usage = _extract_reply_and_usage(raw_res)
+                collected.append(reply_fallback)
+                yield {"type": "delta", "content": reply_fallback}
+
+            elapsed_sec = max(0.001, time.perf_counter() - started)
+            reply = "".join(collected)
+            if not reply and aborted:
+                yield {
+                    "type": "done",
+                    "session_id": sid,
+                    "turn_index": session.turn_index,
+                    "reply": "",
+                    "usage": usage,
+                    "timings": timings,
+                    "elapsed_ms": round(elapsed_sec * 1000.0, 1),
+                    "t2i_hook": _disabled_t2i_hook(t2i_cfg),
+                    "messages_count": len(session.messages),
+                    "aborted": True,
+                }
+                return
+
+            session.messages.append({"role": "user", "content": message})
+            session.messages.append({"role": "assistant", "content": reply})
+            session.turn_index += 1
+            if skill is not None:
+                session.character_name = skill.character_name
+            if not session.title:
+                session.title = message[:28].replace("\n", " ").strip()
+            session.updated_at = self._now_iso()
+            self._persist_session(session)
+
+            turn_index = session.turn_index
+            messages_count = len(session.messages)
+
+            t2i_hook = (
+                _disabled_t2i_hook(t2i_cfg)
+                if aborted
+                else self._dispatch_t2i_hook(
+                    session_id=sid,
+                    turn_index=turn_index,
+                    skill=skill,
+                    user_message=message,
+                    assistant_reply=reply,
+                    session_messages=session.messages,
+                    messages_count=messages_count,
+                    t2i_cfg=t2i_cfg,
+                )
+            )
+
+            yield {
+                "type": "done",
+                "session_id": sid,
+                "turn_index": turn_index,
+                "reply": reply,
+                "usage": usage,
+                "timings": timings,
+                "elapsed_ms": round(elapsed_sec * 1000.0, 1),
+                "t2i_hook": t2i_hook,
+                "messages_count": messages_count,
+                "aborted": aborted,
+            }
+
+    def regenerate_stream(
+        self,
+        session_id: str,
+        params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        """Pop the last assistant reply and regenerate a fresh response for the last user message."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ChatError(
+                "CHAT_INVALID_SESSION_ID",
+                "Field 'session_id' must be a non-empty string.",
+                http_status=400,
+            )
+        sid = session_id.strip()
+        with self._state_lock:
+            session = self._sessions.get(sid)
+        if session is None or not session.messages:
+            raise ChatError(
+                "CHAT_NOTHING_TO_REGENERATE",
+                "No conversation history available to regenerate.",
+                http_status=400,
+            )
+
+        with session.lock:
+            if session.messages and session.messages[-1]["role"] == "assistant":
+                session.messages.pop()
+                session.turn_index = max(0, session.turn_index - 1)
+            if not session.messages or session.messages[-1]["role"] != "user":
+                raise ChatError(
+                    "CHAT_NOTHING_TO_REGENERATE",
+                    "Last message must be a user message to regenerate.",
+                    http_status=400,
+                )
+            last_user_msg = session.messages.pop()["content"]
+            session.updated_at = self._now_iso()
+            self._persist_session(session)
+
+        yield from self.chat_stream(
+            message=last_user_msg,
+            session_id=sid,
+            params=params,
+            cancel_event=cancel_event,
+        )
 
     def send_turn(
         self,
